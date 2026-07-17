@@ -75,9 +75,6 @@ if live_mode:
     st.sidebar.caption(f"Auto-refreshing every {refresh_seconds}s")
 
 if run_now:
-    fetch_time = datetime.now().strftime('%H:%M:%S')
-    st.info(f"Fetching sales for {date_label()} (all pages)... last checked {fetch_time}")
-
     headers = {
         "appid": appid,
         "token": token,
@@ -86,83 +83,81 @@ if run_now:
     }
 
     try:
-        limit = 100
-        offset = 0
-        base_url = f"https://api.xilnex.com/logic/v2/sales/search?sort=id:desc&datefrom={datefrom}&dateto={dateto}"
+        with st.spinner("Loading sales data..."):
+            limit = 100
+            offset = 0
+            base_url = f"https://api.xilnex.com/logic/v2/sales/search?sort=id:desc&datefrom={datefrom}&dateto={dateto}"
 
-        all_sales = []
-        page_count = 0
-        total_size = None
-        status_placeholder = st.empty()
-        stopped_early = False
+            all_sales = []
+            page_count = 0
+            total_size = None
+            stopped_early = False
 
-        def fetch_page(page_url, max_retries=3, timeout=30):
-            last_error = None
-            for attempt in range(1, max_retries + 1):
+            def fetch_page(page_url, max_retries=3, timeout=30):
+                last_error = None
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        return requests.get(page_url, headers=headers, timeout=timeout)
+                    except requests.exceptions.RequestException as e:
+                        last_error = e
+                        print(f"Attempt {attempt}/{max_retries} failed for {page_url}: {e}")
+                        if attempt < max_retries:
+                            time.sleep(2 * attempt)  # backoff: 2s, 4s, ...
+                raise last_error
+
+            network_error_msg = None
+            api_error_payload = None
+
+            while page_count < MAX_PAGES:
+                url = f"{base_url}&offset={offset}&limit={limit}"
+
                 try:
-                    return requests.get(page_url, headers=headers, timeout=timeout)
+                    response = fetch_page(url)
                 except requests.exceptions.RequestException as e:
-                    last_error = e
-                    print(f"Attempt {attempt}/{max_retries} failed for {page_url}: {e}")
-                    if attempt < max_retries:
-                        time.sleep(2 * attempt)  # backoff: 2s, 4s, ...
-            raise last_error
+                    print(f"Giving up at offset {offset} after retries: {e}")
+                    network_error_msg = str(e)
+                    stopped_early = True
+                    break
 
-        while page_count < MAX_PAGES:
-            url = f"{base_url}&offset={offset}&limit={limit}"
+                if response.status_code != 200:
+                    print(f"Error {response.status_code} at offset {offset}")
+                    print("URL that failed:", url)
+                    print(response.text[:2000])
+                    api_error_payload = response.json() if response.text else {}
+                    break
 
-            try:
-                response = fetch_page(url)
-            except requests.exceptions.RequestException as e:
-                st.warning(
-                    f"Network error at offset {offset} after retries ({e}). "
-                    f"Showing summary from the {len(all_sales)} records fetched so far."
-                )
-                print(f"Giving up at offset {offset} after retries: {e}")
-                stopped_early = True
-                break
+                result = response.json()
+                data = result.get("data", {}) or {}
+                page_sales = data.get("sales", []) or []
+                all_sales.extend(page_sales)
 
-            if response.status_code != 200:
-                st.error(f"Error {response.status_code} at offset {offset}")
-                print(f"Error {response.status_code} at offset {offset}")
-                print("URL that failed:", url)
-                print(response.text[:2000])
-                st.json(response.json() if response.text else {})
-                break
+                page_count += 1
+                total_size = data.get("totalSize", total_size)
 
-            result = response.json()
-            data = result.get("data", {}) or {}
-            page_sales = data.get("sales", []) or []
-            all_sales.extend(page_sales)
+                print(f"Fetched page {page_count} (offset {offset}), running total: {len(all_sales)}"
+                      + (f" of {total_size}" if total_size else ""))
 
-            page_count += 1
-            total_size = data.get("totalSize", total_size)
+                # Stop once a page comes back empty, or once we've collected
+                # everything totalSize says exists.
+                if not page_sales:
+                    break
+                if total_size is not None and len(all_sales) >= total_size:
+                    break
 
-            status_placeholder.info(
-                f"Fetched page {page_count} (offset {offset}) — {len(all_sales)}"
-                + (f" of {total_size}" if total_size else "")
-                + " records loaded so far..."
+                offset += limit
+                time.sleep(0.15)  # small pause so we don't hammer the API
+
+        # --- Anything that needs to be shown to the user happens after the spinner closes ---
+        if network_error_msg:
+            st.warning(
+                f"Network error after retries ({network_error_msg}). "
+                f"Showing summary from the {len(all_sales)} records fetched so far."
             )
-            print(f"Fetched page {page_count} (offset {offset}), running total: {len(all_sales)}"
-                  + (f" of {total_size}" if total_size else ""))
-
-            # Stop once a page comes back empty, or once we've collected
-            # everything totalSize says exists.
-            if not page_sales:
-                break
-            if total_size is not None and len(all_sales) >= total_size:
-                break
-
-            offset += limit
-            time.sleep(0.15)  # small pause so we don't hammer the API
-
+        if api_error_payload is not None:
+            st.error(f"Xilnex API error while loading data.")
+            st.json(api_error_payload)
         if page_count >= MAX_PAGES:
             st.warning(f"Stopped after {MAX_PAGES} pages (safety limit) — there may be more data.")
-
-        if stopped_early:
-            status_placeholder.warning(f"⚠️ Loaded {len(all_sales)} sales records across {page_count} page(s) before a network error stopped the fetch.")
-        else:
-            status_placeholder.success(f"✅ Loaded {len(all_sales)} sales records across {page_count} page(s) — updated {datetime.now().strftime('%H:%M:%S')}")
 
         if not all_sales:
             st.warning(f"No sales records found for {date_label()}.")

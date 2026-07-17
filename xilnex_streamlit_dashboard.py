@@ -64,11 +64,12 @@ if live_mode:
     refresh_seconds = st.sidebar.slider("Refresh every (seconds)", 15, 300, 60, step=15)
     st_autorefresh(interval=refresh_seconds * 1000, key="live_refresh")
 
-manual_load = st.sidebar.button(f"Load Sales for {date_label()}")
+manual_load = st.sidebar.button("🔄 Refresh Now")
 
-# In live mode, the page runs automatically (no button needed).
-# Otherwise, it only runs when the button is clicked.
-run_now = manual_load or live_mode
+# Data loads automatically whenever the page opens or a setting changes —
+# no button click required. The button above is just an optional manual
+# refresh if you want the very latest numbers without waiting.
+run_now = True
 
 if live_mode:
     st.sidebar.caption(f"Auto-refreshing every {refresh_seconds}s")
@@ -241,5 +242,3 @@ if run_now:
     except Exception as e:
         st.error(f"❌ An error occurred: {str(e)}")
         st.exception(e)
-else:
-    st.write("👈 Click **Load Sales**, or turn on **Live mode** in the sidebar to auto-refresh.")

@@ -4,6 +4,7 @@ import plotly.express as px
 import requests
 import json
 import time
+import concurrent.futures
 from datetime import date, datetime
 
 try:
@@ -74,90 +75,77 @@ run_now = True
 if live_mode:
     st.sidebar.caption(f"Auto-refreshing every {refresh_seconds}s")
 
-if run_now:
-    headers = {
-        "appid": appid,
-        "token": token,
-        "auth": auth,
-        "Accept": "application/json"
-    }
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_all_sales(datefrom, dateto, appid, token, auth, limit=100, max_pages=200, max_workers=8):
+    """Fetches every page of sales/search for the given date range, in parallel.
+    Cached for 20 seconds so quick repeat loads (reruns, live-mode ticks that
+    land close together) don't re-hit the API at all."""
+    headers = {"appid": appid, "token": token, "auth": auth, "Accept": "application/json"}
+    base_url = f"https://api.xilnex.com/logic/v2/sales/search?sort=id:desc&datefrom={datefrom}&dateto={dateto}"
 
+    def fetch_page(offset, max_retries=3, timeout=30):
+        url = f"{base_url}&offset={offset}&limit={limit}"
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                return requests.get(url, headers=headers, timeout=timeout)
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                if attempt < max_retries:
+                    time.sleep(1.5 * attempt)
+        raise last_error
+
+    errors = []
+
+    # Page 1 first (sequential) — we need it to find out totalSize before
+    # we know how many more pages to request in parallel.
+    try:
+        first_resp = fetch_page(0)
+    except requests.exceptions.RequestException as e:
+        return [], None, [f"Network error: {e}"]
+
+    if first_resp.status_code != 200:
+        return [], None, [f"HTTP {first_resp.status_code}: {first_resp.text[:300]}"]
+
+    first_data = first_resp.json().get("data", {}) or {}
+    all_sales = list(first_data.get("sales", []) or [])
+    total_size = first_data.get("totalSize")
+
+    if not all_sales or total_size is None or len(all_sales) >= total_size:
+        return all_sales, total_size, errors
+
+    remaining_offsets = list(range(limit, min(total_size, limit * max_pages), limit))
+
+    def safe_fetch(offset):
+        try:
+            resp = fetch_page(offset)
+            if resp.status_code != 200:
+                return offset, [], f"HTTP {resp.status_code} at offset {offset}"
+            page_data = resp.json().get("data", {}) or {}
+            return offset, page_data.get("sales", []) or [], None
+        except requests.exceptions.RequestException as e:
+            return offset, [], f"Network error at offset {offset}: {e}"
+
+    # Fire off all remaining pages at once instead of one-by-one.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(safe_fetch, off) for off in remaining_offsets]
+        for future in concurrent.futures.as_completed(futures):
+            offset, sales, err = future.result()
+            if err:
+                errors.append(err)
+            if sales:
+                all_sales.extend(sales)
+
+    return all_sales, total_size, errors
+
+
+if run_now:
     try:
         with st.spinner("Loading sales data..."):
-            limit = 100
-            offset = 0
-            base_url = f"https://api.xilnex.com/logic/v2/sales/search?sort=id:desc&datefrom={datefrom}&dateto={dateto}"
+            all_sales, total_size, fetch_errors = fetch_all_sales(datefrom, dateto, appid, token, auth)
 
-            all_sales = []
-            page_count = 0
-            total_size = None
-            stopped_early = False
-
-            def fetch_page(page_url, max_retries=3, timeout=30):
-                last_error = None
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        return requests.get(page_url, headers=headers, timeout=timeout)
-                    except requests.exceptions.RequestException as e:
-                        last_error = e
-                        print(f"Attempt {attempt}/{max_retries} failed for {page_url}: {e}")
-                        if attempt < max_retries:
-                            time.sleep(2 * attempt)  # backoff: 2s, 4s, ...
-                raise last_error
-
-            network_error_msg = None
-            api_error_payload = None
-
-            while page_count < MAX_PAGES:
-                url = f"{base_url}&offset={offset}&limit={limit}"
-
-                try:
-                    response = fetch_page(url)
-                except requests.exceptions.RequestException as e:
-                    print(f"Giving up at offset {offset} after retries: {e}")
-                    network_error_msg = str(e)
-                    stopped_early = True
-                    break
-
-                if response.status_code != 200:
-                    print(f"Error {response.status_code} at offset {offset}")
-                    print("URL that failed:", url)
-                    print(response.text[:2000])
-                    api_error_payload = response.json() if response.text else {}
-                    break
-
-                result = response.json()
-                data = result.get("data", {}) or {}
-                page_sales = data.get("sales", []) or []
-                all_sales.extend(page_sales)
-
-                page_count += 1
-                total_size = data.get("totalSize", total_size)
-
-                print(f"Fetched page {page_count} (offset {offset}), running total: {len(all_sales)}"
-                      + (f" of {total_size}" if total_size else ""))
-
-                # Stop once a page comes back empty, or once we've collected
-                # everything totalSize says exists.
-                if not page_sales:
-                    break
-                if total_size is not None and len(all_sales) >= total_size:
-                    break
-
-                offset += limit
-                time.sleep(0.15)  # small pause so we don't hammer the API
-
-        # --- Anything that needs to be shown to the user happens after the spinner closes ---
-        if network_error_msg:
-            st.warning(
-                f"Network error after retries ({network_error_msg}). "
-                f"Showing summary from the {len(all_sales)} records fetched so far."
-            )
-        if api_error_payload is not None:
-            st.error(f"Xilnex API error while loading data.")
-            st.json(api_error_payload)
-        if page_count >= MAX_PAGES:
-            st.warning(f"Stopped after {MAX_PAGES} pages (safety limit) — there may be more data.")
+        for err in fetch_errors:
+            st.warning(f"Some data may be incomplete: {err}")
 
         if not all_sales:
             st.warning(f"No sales records found for {date_label()}.")
